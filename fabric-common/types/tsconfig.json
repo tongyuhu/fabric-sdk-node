@@ -10,7 +10,7 @@
     "suppressImplicitAnyIndexErrors": true,
     "moduleResolution": "node",
     "module": "commonjs",
-    "target": "es6",
+    "target": "es2017",
     "outDir": "dist",
     "baseUrl": ".",
     "paths": {
@@ -21,6 +21,9 @@
   },
   "files": [
       "index.d.ts"
+  ],
+  "exclude": [
+    "test/data/**"
   ],
   "formatCodeOptions": {
     "indentSize": 4,

@@ -11,8 +11,8 @@
  * client applications to interact with smart contracts deployed to a Hyperledger Fabric blockchain network.</p>
  *
  * <p>Note that administrative capabilities, such as installing and starting smart contracts, are not currently provided
- * by this API. For these tasks or other specific advanced usage, the lower level <em>fabric-client</em> API
- * should be used. Access to related <em>fabric-client</em> objects is provided through the <em>fabric-network</em>
+ * by this API. For these tasks or other specific advanced usage, the lower level <em>fabric-common</em> API
+ * should be used. Access to related <em>fabric-common</em> objects is provided through the <em>fabric-network</em>
  * API objects.</p>
  *
  * [TypeScript]{@link http://www.typescriptlang.org/} definitions are included in this module.
@@ -149,9 +149,8 @@ module.exports.Wallets = require('./lib/impl/wallet/wallets').Wallets;
 module.exports.IdentityProviderRegistry = require('./lib/impl/wallet/identityproviderregistry').IdentityProviderRegistry;
 module.exports.HsmX509Provider = require('./lib/impl/wallet/hsmx509identity').HsmX509Provider;
 module.exports.DefaultEventHandlerStrategies = require('fabric-network/lib/impl/event/defaulteventhandlerstrategies');
-module.exports.DefaultQueryHandlerStrategies = require('fabric-network/lib/impl/query/defaultqueryhandlerstrategies');
-module.exports.CheckpointFactories = require('fabric-network/lib/impl/event/checkpointfactories');
-module.exports.EventHubSelectionStrategies = require('fabric-network/lib/impl/event/defaulteventhubselectionstrategies');
+module.exports.QueryHandlerStrategies = require('fabric-network/lib/impl/query/queryhandlerstrategies');
+
 module.exports.TimeoutError = require('fabric-network/lib/errors/timeouterror');
 module.exports.FileSystemCheckpointer = require('fabric-network/lib/impl/event/filesystemcheckpointer');
 module.exports.BaseCheckpointer = require('fabric-network/lib/impl/event/basecheckpointer');

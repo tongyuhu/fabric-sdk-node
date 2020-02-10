@@ -244,7 +244,7 @@ class Proposal extends ServiceAction {
 	/**
 	 * @typedef {Object} SendProposalRequest
 	 * @property {Peer[]} [targets] - Optional. The peers to send the proposal.
-	 * @property {EndorsementHandler} - [handler] - Optional. The handler to send the proposal.
+	 * @property {ServiceHandler} - [handler] - Optional. The handler to send the proposal.
 	 * @property {Number} [requestTimeout] - Optional. The request timeout
 	 */
 
@@ -332,6 +332,7 @@ message Endorsement {
 		this._proposalErrors = [];
 
 		if (handler) {
+			logger.debug('%s - endorsing with a handler', method);
 			let results;
 			if (this.type === 'Query') {
 				results = await handler.query(signedEnvelope, request);
@@ -362,7 +363,7 @@ message Endorsement {
 				if (result.isFulfilled()) {
 					const response = result.value();
 					if (response && response.response && response.response.status) {
-						logger.debug('%s - Promise is fulfilled: %j', method, response);
+						logger.debug('%s - Promise is fulfilled: %s', method, response.response.status);
 						this._proposalResponses.push(response);
 					} else if (response instanceof Error) {
 						logger.debug('%s - Promise response is an error: %s', method, response);
@@ -383,21 +384,21 @@ message Endorsement {
 		}
 
 		const return_results =  {
-			errors: this._proposalErrors.length > 0 ? this._proposalErrors : null,
-			responses: this._proposalResponses.length > 0 ? this._proposalResponses : null
+			errors: this._proposalErrors,
+			responses: this._proposalResponses
 		};
 
 		if (this.type === 'Query') {
 			this._queryResults = [];
 			this._proposalResponses.forEach((response) => {
-				if (response.response && response.response.payload) {
-					logger.debug('%s - good status', method);
+				if (response.response && response.response.payload && response.response.payload.length > 0) {
+					logger.debug('%s - have payload', method);
 					this._queryResults.push(response.response.payload);
 				} else {
 					logger.error('%s - unknown or missing results in query', method);
 				}
 			});
-			return_results.queryResults = this._queryResults.length > 0 ? this._queryResults : null;
+			return_results.queryResults = this._queryResults;
 		}
 
 		return return_results;

@@ -1,14 +1,16 @@
 /**
- * Copyright 2019 IBM All Rights Reserved.
+ * Copyright 2019, 2020 IBM All Rights Reserved.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
 
 const TYPE = 'Client';
 
+const path = require('path');
 const crypto = require('crypto');
 
-const {checkParameter, getLogger, pemToDER, setConfigSetting, getConfigSetting} = require('./Utils.js');
+const {checkParameter, getLogger, pemToDER, getConfig, setConfigSetting,
+	getConfigSetting, newCryptoSuite} = require('./Utils.js');
 const Channel = require('./Channel');
 const Endpoint = require('./Endpoint');
 const Committer = require('./Committer');
@@ -17,6 +19,11 @@ const Eventer = require('./Eventer');
 const Discoverer = require('./Discoverer');
 const IdentityContext = require('./IdentityContext');
 const logger = getLogger(TYPE);
+
+const config = getConfig();
+// setup the location of the default config shipped with code
+const default_config = path.resolve(__dirname, '../config/default.json');
+config.reorderFileStores(default_config); // make sure this default has precedences
 
 /**
  * @classdesc
@@ -399,9 +406,9 @@ const Client = class {
 			// generate X509 cert pair
 			// use the default software cryptosuite, not the client assigned cryptosuite, which may be
 			// HSM, or the default has been set to HSM. FABN-830
-			const key = Client.newCryptoSuite({software: true}).generateEphemeralKey();
+			const key = newCryptoSuite({software: true}).generateEphemeralKey();
 			this._tls_mutual.clientKey = key.toBytes();
-			this._tls_mutual.clientCert = key.generateX509Certificate('fabric-client');
+			this._tls_mutual.clientCert = key.generateX509Certificate('fabric-common');
 			this._tls_mutual.selfGenerated = true;
 		}
 

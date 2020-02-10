@@ -6,6 +6,7 @@
 'use strict';
 
 const Client = require('fabric-client');
+const Utils = require('fabric-common/lib/Utils.js');
 
 class IDManager {
 	constructor(ccp, hsmOptions) {
@@ -16,10 +17,10 @@ class IDManager {
 
 	async initialize() {
 		this.defaultClient = await Client.loadFromConfig(this.ccp);
-		this.defaultClient.setCryptoSuite(Client.newCryptoSuite());
+		this.defaultClient.setCryptoSuite(Utils.newCryptoSuite());
 
 		this.hsmClient = await Client.loadFromConfig(this.ccp);
-		const hsmCryptoSuite = Client.newCryptoSuite(this.hsmOptions);
+		const hsmCryptoSuite = Utils.newCryptoSuite(this.hsmOptions);
 		// Setting a key store triggers enrollment using this crypto suite to store the generated private key in the HSM
 		hsmCryptoSuite.setCryptoKeyStore(Client.newCryptoKeyStore({path: '/tmp'}));
 		this.hsmClient.setCryptoSuite(hsmCryptoSuite);
@@ -28,8 +29,7 @@ class IDManager {
 	async registerUser(userID, issuerWallet, issuerId, options = {}) {
 		const identity = await issuerWallet.get(issuerId);
 		const provider = issuerWallet.getProviderRegistry().getProvider(identity.type);
-		await provider.setUserContext(this.defaultClient, identity, issuerId);
-		const user = await this.defaultClient.getUserContext();
+		const user = await provider.getUserContext(identity, issuerId);
 
 		const registerRequest = {
 			enrollmentID: userID,

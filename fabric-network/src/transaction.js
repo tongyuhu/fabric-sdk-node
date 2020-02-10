@@ -1,37 +1,67 @@
 /**
- * Copyright 2018 IBM All Rights Reserved.
+ * Copyright 2018, 2019 IBM All Rights Reserved.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
 
 'use strict';
 
-const Query = require('fabric-network/lib/impl/query/query');
-
-const logger = require('fabric-network/lib/logger').getLogger('Transaction');
 const util = require('util');
+const logger = require('fabric-network/lib/logger').getLogger('Transaction');
 
-const noOpTxEventHandler = {
+const noOpEventHandler = {
 	startListening: async () => {},
 	waitForEvents: async () => {},
 	cancelListening: () => {}
 };
 
-/**
- * Ensure supplied transaction arguments are not strings.
- * @private
- * @static
- * @param {Array} args transaction arguments.
- * @throws {Error} if any arguments are invalid.
- */
-function verifyArguments(args) {
-	const isInvalid = args.some((arg) => typeof arg !== 'string');
-	if (isInvalid) {
-		const argsString = args.map((arg) => util.format('%j', arg)).join(', ');
-		const msg = util.format('Transaction arguments must be strings: %s', argsString);
-		logger.error('verifyArguments:', msg);
-		throw new Error(msg);
+function noOpEventHandlerStrategyFactory() {
+	return noOpEventHandler;
+}
+
+function getResponsePayload(proposalResponse) {
+	const validEndorsementResponse = getValidEndorsementResponse(proposalResponse.responses);
+
+	if (!validEndorsementResponse) {
+		const error = newEndorsementError(proposalResponse);
+		logger.error(error);
+		throw error;
 	}
+
+	return validEndorsementResponse.response.payload;
+}
+
+function getValidEndorsementResponse(endorsementResponses) {
+	return endorsementResponses.find((endorsementResponse) => endorsementResponse.endorsement);
+}
+
+function newEndorsementError(proposalResponse) {
+	const errorInfos = [];
+
+	for (const error of proposalResponse.errors) {
+		error.peer = error.connection.name;
+		error.status = 'grpc';
+		errorInfos.push(error);
+	}
+
+	for (const endorsement of proposalResponse.responses) {
+		const errorInfo = {
+			peer: endorsement.connection.name,
+			status: endorsement.response.status,
+			message: endorsement.response.message
+		};
+		errorInfos.push(errorInfo);
+	}
+
+	const messages = ['No valid responses from any peers. Errors:'];
+	for (const errorInfo of errorInfos) {
+		messages.push(util.format('peer=%s, status=%s, message=%s',
+			errorInfo.peer,
+			errorInfo.status,
+			errorInfo.message));
+	}
+
+	return new Error(messages.join('\n    '));
 }
 
 /**
@@ -49,45 +79,49 @@ class Transaction {
 	/*
 	 * @param {Contract} contract Contract to which this transaction belongs.
 	 * @param {String} name Fully qualified transaction name.
+	 * @param {function} eventStrategyFactory - A factory function that will return
+	 * an EventStrategy.
 	 */
 	constructor(contract, name) {
-		this._contract = contract;
+		const method = `constructor[${name}]`;
+		logger.debug('%s - start', method);
+
+		this.contract = contract;
 		this._name = name;
-		this._transactionId = contract.createTransactionID();
 		this._transientMap = null;
-		this._createTxEventHandler = (() => noOpTxEventHandler);
+		this._options = contract.gateway.getOptions();
+		this._eventHandlerStrategyFactory = this._options.transaction.strategy || noOpEventHandlerStrategyFactory;
 		this._isInvoked = false;
-		this._queryHandler = contract.getNetwork().getQueryHandler();
-		this._endorsingPeers = null;
+		this.queryHandler = contract.network.queryHandler;
+		this._endorsingPeers = null; // for user assigned endorsements
+		this._commitingOrderers = null; // for user assigned orderers
+		this.transactionId = null; // will have a value after a submit
+
+		// the signer of the outbound requests to the fabric network
+		this.identityContext = this.contract.gateway.identityContext;
 	}
 
 	/**
 	 * Get the fully qualified name of the transaction function.
-	 * @returns {String} Transaction name.
+	 * @returns {string} Transaction name.
 	 */
 	getName() {
 		return this._name;
 	}
 
 	/**
-	 * Get the ID that will be used for this transaction invocation.
-	 * @returns {module:fabric-client.TransactionID} Transaction ID.
-	 */
-	getTransactionID() {
-		return this._transactionId;
-	}
-
-	/**
-	 * Set the event handler strategy to be used for this transaction invocation.
+	 * Override the Gateway option for event handler strategy
 	 * @private
-	 * @param {Function} factoryFunction Event handler factory function.
-	 * @returns {module:fabric-network.Transaction} This object, to allow function chaining.
+	 * @param {*} eventHandlerStrategyFactory
 	 */
-	setEventHandlerStrategy(factoryFunction) {
-		this._createTxEventHandler = factoryFunction;
+	setEventHandlerStrategy(eventHandlerStrategyFactory) {
+		const method = `setEventHandlerStrategy[${this._name}]`;
+		logger.debug('%s - start', method);
+
+		this._eventHandlerStrategyFactory = eventHandlerStrategyFactory;
+
 		return this;
 	}
-
 	/**
 	 * Set transient data that will be passed to the transaction function
 	 * but will not be stored on the ledger. This can be used to pass
@@ -97,17 +131,50 @@ class Transaction {
 	 * @returns {module:fabric-network.Transaction} This object, to allow function chaining.
 	 */
 	setTransient(transientMap) {
+		const method = `setTranssient[${this._name}]`;
+		logger.debug('%s - start', method);
+
 		this._transientMap = transientMap;
+
 		return this;
 	}
 
 	/**
-	 * Set the peers that should be used for endorsement when this transaction is submitted to the ledger.
-	 * @param {ChannelPeer[]} peers Endorsing peers.
+	 * Set the peers that should be used for endorsement when this transaction
+	 * is submitted to the ledger.
+	 * Setting the peers will override the use of discovery and the submit will
+	 * send the proposal to these peers.
+	 * This will override the setEndorsingOrganizations if previously called.
+	 * @param {Endorser[]} peers - Endorsing peers.
 	 * @returns {module:fabric-network.Transaction} This object, to allow function chaining.
 	 */
 	setEndorsingPeers(peers) {
+		const method = `setEndorsingPeers[${this._name}]`;
+		logger.debug('%s - start', method);
+
 		this._endorsingPeers = peers;
+		this._endorsingOrgs = null;
+
+		return this;
+	}
+
+	/**
+	 * Set the organizations that should be used for endorsement when this
+	 * transaction is submitted to the ledger.
+	 * Peers that are in the organizations will be used for the endorsement.
+	 * This will override the setEndorsingPeers if previously called. Setting
+	 * the endorsing organizations will not override discovery, however it will
+	 * filter the peers provided by discovery to be those in these organizatons.
+	 * @param {string[]} orgs - Endorsing organizations.
+	 * @returns {module:fabric-network.Transaction} This object, to allow function chaining.
+	 */
+	setEndorsingOrganizations(...orgs) {
+		const method = `setEndorsingOrganizations[${this._name}]`;
+		logger.debug('%s - start', method);
+
+		this._endorsingOrgs = orgs;
+		this._endorsingPeers = null;
+
 		return this;
 	}
 
@@ -116,7 +183,7 @@ class Transaction {
 	 * @returns {module:fabric-network.Network}
 	 */
 	getNetwork() {
-		return this._contract.getNetwork();
+		return this.contract.network;
 	}
 
 	/**
@@ -124,71 +191,123 @@ class Transaction {
 	 * will be evaluated on the endorsing peers and then submitted to the ordering service
 	 * for committing to the ledger.
 	 * @async
-     * @param {...String} [args] Transaction function arguments.
+     * @param {...string} [args] Transaction function arguments.
      * @returns {Buffer} Payload response from the transaction function.
 	 * @throws {module:fabric-network.TimeoutError} If the transaction was successfully submitted to the orderer but
 	 * timed out before a commit event was received from peers.
      */
 	async submit(...args) {
-		verifyArguments(args);
-		this._setInvokedOrThrow();
+		const method = `submit[${this._name}]`;
+		logger.debug('%s - start', method);
 
-		const network = this._contract.getNetwork();
-		const channel = network.getChannel();
-		const txId = this._transactionId.getTransactionID();
-		const options = this._contract.getEventHandlerOptions();
-		const eventHandler = this._createTxEventHandler(this, network, options);
+		const channel = this.contract.network.channel;
+		const endorsementOptions = this._buildEndorsementOptions(args);
+		if (Number.isInteger(this._options.transaction.endorseTimeout)) {
+			endorsementOptions.requestTimeout = this._options.transaction.endorseTimeout * 1000; // in ms;
+		}
 
-		const request = this._buildRequest(args);
+		// This is the object that will centralize this endorsement activities
+		// with the fabric network
+		const endorsement = channel.newEndorsement(this.contract.chaincodeId);
+		if (this.contract.collections) {
+			for (const collection of this.contract.collections) {
+				endorsement.addCollectionInterest(collection);
+			}
+		}
+
 		if (this._endorsingPeers) {
-			request.targets = this._endorsingPeers;
+			logger.debug('%s - user has assigned targets', method);
+			endorsementOptions.targets = this._endorsingPeers;
+		} else if (this.contract.network.discoveryService) {
+			logger.debug('%s - discovery handler will be used for endorsing', method);
+			endorsementOptions.handler = await this.contract.getDiscoveryHandler(endorsement);
+			if (this._endorsingOrgs) {
+				endorsementOptions.requiredOrgs = this._endorsingOrgs;
+			}
+		} else if (this._endorsingOrgs) {
+			logger.debug('%s - user has assigned an endorsing orgs %s', method, this._endorsingOrgs);
+			const flatten = (accumulator, value) => {
+				accumulator.push(...value);
+				return accumulator;
+			};
+			endorsementOptions.targets = this._endorsingOrgs.map(channel.getEndorsers).reduce(flatten, []);
+		} else {
+			logger.debug('%s - targets will be all that are assigned to this channel', method);
+			endorsementOptions.targets = channel.getEndorsers();
 		}
 
-		const commitTimeout = options.commitTimeout * 1000; // in ms
-		let timeout = this._contract.gateway.getClient().getConfigSetting('request-timeout', commitTimeout);
-		if (timeout < commitTimeout) {
-			timeout = commitTimeout;
+		// by now we should have targets or a discovery handler to be used
+		// by the send() of the proposal instance
+
+		logger.debug('%s - build and send the endorsement', method);
+
+		// build the outbound request along with getting a new transactionId
+		// from the identity context
+		endorsement.build(this.identityContext, endorsementOptions);
+		endorsement.sign(this.identityContext);
+
+		// ------- S E N D   P R O P O S A L
+		// This is where the request gets sent to the peers
+		const proposalResponse = await endorsement.send(endorsementOptions);
+		try {
+			const result = getResponsePayload(proposalResponse);
+
+			// The endorsement is the source for the transaction id.
+			// The endorsement created the transaction id on demand
+			// when it built the proposal.
+			this.transactionId = endorsement.getTransactionId();
+
+			// ------- E V E N T   M O N I T O R
+			const eventHandler = this._eventHandlerStrategyFactory(this, this._options.transaction);
+			await eventHandler.startListening(this.identityContext);
+
+			const commitOptions = {};
+			if (Number.isInteger(this._options.transaction.commitTimeout)) {
+				commitOptions.requestTimeout = this._options.transaction.commitTimeout * 1000; // in ms;
+			}
+			if (endorsementOptions.handler) {
+				logger.debug('%s - use discovery to commit', method);
+				commitOptions.handler = endorsementOptions.handler;
+			} else {
+				logger.debug('%s - use the orderers assigned to the channel', method);
+				commitOptions.targets = channel.getCommitters();
+			}
+
+			// by now we should have a discovery handler or use the target orderers
+			// that have been assigned from the channel to perform the commit
+
+			const commit = endorsement.newCommit();
+			commit.build(this.identityContext, commitOptions);
+			commit.sign(this.identityContext);
+
+			// -----  C O M M I T   E N D O R S E M E N T
+			// this is where the endorsement results are sent to the orderer
+			const commitResponse = await commit.send(commitOptions);
+
+			logger.debug('%s - commit response %j', method, commitResponse);
+
+			if (commitResponse.status !== 'SUCCESS') {
+				const msg = `Failed to commit transaction %${endorsement.transactionId}, orderer response status: ${commitResponse.status}`;
+				logger.error('%s - %s', method, msg);
+				eventHandler.cancelListening();
+				throw new Error(msg);
+			} else {
+				logger.debug('%s - successful commit', method);
+			}
+
+			logger.debug('%s - wait for the transaction to be committed on the peer', method);
+			await eventHandler.waitForEvents();
+
+			return result;
+		} catch (err) {
+			err.responses = proposalResponse.responses;
+			err.errors = proposalResponse.errors;
+			throw err;
 		}
-
-		// node sdk will target all peers on the channel that are endorsingPeer or do something special for a discovery environment
-		const results = await channel.sendTransactionProposal(request, timeout);
-		const proposalResponses = results[0];
-		const proposal = results[1];
-
-		// get only the valid responses to submit to the orderer
-		const {validResponses} = this._validatePeerResponses(proposalResponses);
-
-		await eventHandler.startListening();
-
-		// Submit the endorsed transaction to the primary orderers.
-		const response = await channel.sendTransaction({
-			proposalResponses: validResponses,
-			proposal
-		});
-
-		if (response.status !== 'SUCCESS') {
-			const msg = util.format('Failed to send peer responses for transaction %j to orderer. Response status: %j', txId, response.status);
-			logger.error('submit:', msg);
-			eventHandler.cancelListening();
-			throw new Error(msg);
-		}
-
-		await eventHandler.waitForEvents();
-
-		return validResponses[0].response.payload || null;
 	}
 
-	_setInvokedOrThrow() {
-		if (this._isInvoked) {
-			throw new Error('Transaction has already been invoked');
-		}
-		this._isInvoked = true;
-	}
-
-	_buildRequest(args) {
+	_buildEndorsementOptions(args) {
 		const request = {
-			chaincodeId: this._contract.getChaincodeId(),
-			txId: this._transactionId,
 			fcn: this._name,
 			args: args
 		};
@@ -199,94 +318,35 @@ class Transaction {
 	}
 
 	/**
-     * Check for proposal response errors.
-     * @private
-     * @param {any} responses the responses from the install, instantiate or invoke
-     * @return {Object} number of ignored errors and valid responses
-     * @throws if there are no valid responses at all.
-     */
-	_validatePeerResponses(responses) {
-		if (!responses.length) {
-			logger.error('_validatePeerResponses: No results were returned from the request');
-			throw new Error('No results were returned from the request');
-		}
-
-		const validResponses = [];
-		const errorResponses = [];
-
-		responses.forEach((responseContent) => {
-			if (responseContent instanceof Error) {
-				// this is either an error from the sdk, peer response or chaincode response.
-				// we can distinguish between sdk vs peer/chaincode by the isProposalResponse flag in the future.
-				// TODO: would be handy to know which peer the response is from and include it here.
-				logger.warn('_validatePeerResponses: Received error response from peer:', responseContent);
-				errorResponses.push(responseContent);
-			} else {
-				// anything else is a successful response ie status will be less then 400.
-				// in the future we can do things like verifyProposalResponse and compareProposalResponseResults
-				// as part of an extended client side validation strategy but for now don't perform any client
-				// side checks as the peers will have to do this anyway and it impacts client performance
-				logger.debug('_validatePeerResponses: valid response from peer %j', responseContent.peer);
-				validResponses.push(responseContent);
-			}
-		});
-
-		if (validResponses.length === 0) {
-			const errorMessages = errorResponses.map((response) => util.format('peer=%s, status=%s, message=%s',
-				response.peer.name, response.status, response.message));
-			const messages = Array.of(`No valid responses from any peers. ${errorResponses.length} peer error responses:`,
-				...errorMessages);
-			const msg = messages.join('\n    ');
-			logger.error('_validatePeerResponses: ' + msg);
-			throw new Error(msg);
-		}
-
-		return {validResponses, invalidResponses: errorResponses};
-	}
-
-	/**
 	 * Evaluate a transaction function and return its results.
 	 * The transaction function will be evaluated on the endorsing peers but
 	 * the responses will not be sent to the ordering service and hence will
 	 * not be committed to the ledger.
 	 * This is used for querying the world state.
 	 * @async
-     * @param {...String} [args] Transaction function arguments.
+     * @param {...string} [args] Transaction function arguments.
      * @returns {Buffer} Payload response from the transaction function.
      */
 	async evaluate(...args) {
-		verifyArguments(args);
-		this._setInvokedOrThrow();
+		const method = `evaluate[${this._name}]`;
+		logger.debug('%s - start', method);
 
-		const channel = this._contract.getNetwork().getChannel();
-		const request = this._buildRequest(args);
-
-		const commitTimeout = this._contract.getEventHandlerOptions().commitTimeout * 1000; // in ms
-		const timeout = this._contract.gateway.getClient().getConfigSetting('request-timeout', commitTimeout);
-		if (timeout < commitTimeout) {
-			request.request_timeout = commitTimeout;
+		const request = this._buildEndorsementOptions(args);
+		if (Number.isInteger(this._options.query.timeout)) {
+			request.requestTimeout = this._options.query.timeout * 1000; // in ms;
 		}
 
-		const query = new Query(channel, request);
+		const query = this.contract.network.channel.newQuery(this.contract.chaincodeId);
 
-		return this._queryHandler.evaluate(query);
-	}
+		logger.debug('%s - build and sign the query', method);
+		query.build(this.identityContext, request);
+		query.sign(this.identityContext);
 
-	/**
-	 * Create a commit event listener for this transaction.
-	 * @param {Function} callback - This callback will be triggered when
-	 *		a transaction commit event is emitted. It takes parameters
-	 * 		of error, transactionId, transaction status and block number
-	 * @param {module:fabric-network.Network~ListenerOptions} [options] - Optional. Options on
-	 * 		registrations allowing start and end block numbers.
-	 * @param {ChannelEventHub} [eventHub] - Optional. Used to override the event hub selection
-	 * @returns {module:fabric-network~CommitEventListener}
-	 * @async
-	 */
-	async addCommitListener(callback, options, eventHub) {
-		const txid = this.getTransactionID().getTransactionID();
-		const network = this._contract.getNetwork();
-		return network.addCommitListener(txid, callback, options, eventHub);
+		logger.debug('%s - handler will send', method);
+		const results = await this.queryHandler.evaluate(query);
+		logger.debug('%s - queryHandler completed %j', method, results);
+
+		return results;
 	}
 }
 
